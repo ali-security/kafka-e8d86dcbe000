@@ -17,17 +17,22 @@
 
 package org.apache.kafka.common.security.oauthbearer;
 
+import static org.apache.kafka.common.config.SaslConfigs.SASL_OAUTHBEARER_ALLOW_UNVERIFIED_ISSUER;
 import static org.apache.kafka.common.config.SaslConfigs.SASL_OAUTHBEARER_EXPECTED_AUDIENCE;
+import static org.apache.kafka.common.config.SaslConfigs.SASL_OAUTHBEARER_EXPECTED_ISSUER;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.Arrays;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import javax.security.auth.callback.Callback;
+import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.common.security.oauthbearer.internals.secured.AccessTokenBuilder;
 import org.apache.kafka.common.security.oauthbearer.internals.secured.AccessTokenValidator;
 import org.apache.kafka.common.security.oauthbearer.internals.secured.AccessTokenValidatorFactory;
@@ -49,7 +54,10 @@ public class OAuthBearerValidatorCallbackHandlerTest extends OAuthBearerTest {
             .alg(AlgorithmIdentifiers.RSA_USING_SHA256);
         String accessToken = builder.build();
 
-        Map<String, ?> configs = getSaslConfigs(SASL_OAUTHBEARER_EXPECTED_AUDIENCE, allAudiences);
+        Map<String, Object> overrides = new HashMap<>();
+        overrides.put(SASL_OAUTHBEARER_EXPECTED_AUDIENCE, allAudiences);
+        overrides.put(SASL_OAUTHBEARER_ALLOW_UNVERIFIED_ISSUER, true);
+        Map<String, ?> configs = getSaslConfigs(overrides);
         OAuthBearerValidatorCallbackHandler handler = createHandler(configs, builder);
 
         try {
@@ -79,7 +87,10 @@ public class OAuthBearerValidatorCallbackHandlerTest extends OAuthBearerTest {
     }
 
     private void assertInvalidAccessTokenFails(String accessToken, String expectedMessageSubstring) throws Exception {
-        Map<String, ?> configs = getSaslConfigs();
+        Map<String, Object> overrides = new HashMap<>();
+        overrides.put(SASL_OAUTHBEARER_EXPECTED_AUDIENCE, Arrays.asList("a"));
+        overrides.put(SASL_OAUTHBEARER_EXPECTED_ISSUER, "https://issuer.example.com");
+        Map<String, ?> configs = getSaslConfigs(overrides);
         OAuthBearerValidatorCallbackHandler handler = createHandler(configs, new AccessTokenBuilder());
 
         try {
@@ -90,6 +101,44 @@ public class OAuthBearerValidatorCallbackHandlerTest extends OAuthBearerTest {
             String actualMessage = callback.errorStatus();
             assertNotNull(actualMessage);
             assertTrue(actualMessage.contains(expectedMessageSubstring), String.format("The error message \"%s\" didn't contain the expected substring \"%s\"", actualMessage, expectedMessageSubstring));
+        } finally {
+            handler.close();
+        }
+    }
+
+    @Test
+    public void testFailsToConfigureWhenExpectedAudienceMissing() {
+        // The broker's JWKS validator must refuse to start, rather than accept tokens whose audience cannot be verified.
+        Map<String, ?> configs = getSaslConfigs(SASL_OAUTHBEARER_EXPECTED_ISSUER, "https://issuer.example.com");
+        ConfigException e = assertThrows(ConfigException.class, () -> createHandler(configs, new AccessTokenBuilder()));
+        assertTrue(e.getMessage().contains(SASL_OAUTHBEARER_EXPECTED_AUDIENCE), e.getMessage());
+    }
+
+    @Test
+    public void testFailsToConfigureWhenExpectedIssuerMissing() {
+        // The broker's JWKS validator must refuse to start, rather than accept tokens whose issuer cannot be verified.
+        Map<String, ?> configs = getSaslConfigs(SASL_OAUTHBEARER_EXPECTED_AUDIENCE, Arrays.asList("a"));
+        ConfigException e = assertThrows(ConfigException.class, () -> createHandler(configs, new AccessTokenBuilder()));
+        assertTrue(e.getMessage().contains(SASL_OAUTHBEARER_EXPECTED_ISSUER), e.getMessage());
+    }
+
+    @Test
+    public void testOptOutsAllowUnverifiedIssuerAndAudience() throws Exception {
+        // With both opt-outs (as String values, the way a broker passes keys its KafkaConfig does not define),
+        // a token with any audience and no issuer is accepted.
+        AccessTokenBuilder builder = new AccessTokenBuilder()
+            .audience("some-other-service")
+            .jwk(createRsaJwk())
+            .alg(AlgorithmIdentifiers.RSA_USING_SHA256);
+        String accessToken = builder.build();
+        Map<String, Object> overrides = new HashMap<>();
+        overrides.put("sasl.oauthbearer.allow.unverified.audience", "true");
+        overrides.put(SASL_OAUTHBEARER_ALLOW_UNVERIFIED_ISSUER, "true");
+        OAuthBearerValidatorCallbackHandler handler = createHandler(getSaslConfigs(overrides), builder);
+        try {
+            OAuthBearerValidatorCallback callback = new OAuthBearerValidatorCallback(accessToken);
+            handler.handle(new Callback[]{callback});
+            assertNotNull(callback.token(), callback.errorStatus());
         } finally {
             handler.close();
         }
